@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.view.WindowManager
+import com.gemmaproj.voicechat.engine.WalkOrders
 import androidx.activity.ComponentActivity
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
@@ -38,6 +39,7 @@ import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -82,7 +84,8 @@ fun SceneCamera(state: ChatUiState, viewModel: ChatViewModel) {
             setEnabledUseCases(CameraController.IMAGE_CAPTURE or CameraController.IMAGE_ANALYSIS)
             imageCaptureMode = ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY
             imageAnalysisBackpressureStrategy = ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST
-            setImageAnalysisTargetSize(CameraController.OutputSize(android.util.Size(640, 480)))
+            // The walk tiles each frame for YOLO; 640×480 leaves objects across the room too small to find.
+            setImageAnalysisTargetSize(CameraController.OutputSize(android.util.Size(1280, 960)))
             cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
         }
     }
@@ -257,7 +260,7 @@ fun SceneCamera(state: ChatUiState, viewModel: ChatViewModel) {
             Text(
                 text = state.sceneCaption.ifBlank {
                     if (state.visionReady || state.trackReady) {
-                        "Pick a target and tap Go. Keep the dog and the target in view."
+                        "Hold to talk: \"go to the cup\", \"now the shoe\", \"stop\". Keep the dog and the target in view."
                     } else {
                         state.status
                     }
@@ -286,8 +289,8 @@ fun SceneCamera(state: ChatUiState, viewModel: ChatViewModel) {
                 for ((label, query) in APPROACH_TARGETS) {
                     TargetChip(
                         label = label,
-                        selected = state.trackTarget == query,
-                        enabled = !state.approachLive,
+                        selected = WalkOrders.targetLabel(state.trackTarget) == query,
+                        enabled = true,
                         onClick = { viewModel.setTrackTarget(query) },
                     )
                 }
@@ -307,7 +310,20 @@ fun SceneCamera(state: ChatUiState, viewModel: ChatViewModel) {
                         containerColor = if (state.approachLive) Color(0xFFC62828) else Color(0xFF2E7D32),
                     ),
                 ) {
-                    Text(if (state.approachLive) "Stop" else "Go to ${targetLabel(state.trackTarget)}")
+                    Text(
+                        if (state.approachLive) {
+                            "Stop"
+                        } else {
+                            "Go to ${listOfNotNull(state.trackColor, targetLabel(state.trackTarget)).joinToString(" ")}"
+                        },
+                    )
+                }
+                OutlinedButton(
+                    onClick = viewModel::restartDemo,
+                    enabled = !state.isRecording,
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
+                ) {
+                    Text("Restart")
                 }
                 TargetChip(
                     label = "Live",
@@ -344,6 +360,8 @@ fun SceneCamera(state: ChatUiState, viewModel: ChatViewModel) {
     }
 }
 
+private const val MAX_FRAME_EDGE = 1280
+
 private fun uprightFrame(image: ImageProxy): Bitmap {
     val raw = image.toBitmap()
     val rotation = image.imageInfo.rotationDegrees
@@ -356,8 +374,8 @@ private fun uprightFrame(image: ImageProxy): Bitmap {
         turned
     }
     val longEdge = max(rotated.width, rotated.height)
-    if (longEdge <= 640) return rotated
-    val scale = 640f / longEdge
+    if (longEdge <= MAX_FRAME_EDGE) return rotated
+    val scale = MAX_FRAME_EDGE.toFloat() / longEdge
     val width = (rotated.width * scale).toInt().coerceAtLeast(1)
     val height = (rotated.height * scale).toInt().coerceAtLeast(1)
     val scaled = Bitmap.createScaledBitmap(rotated, width, height, true)
@@ -365,16 +383,17 @@ private fun uprightFrame(image: ImageProxy): Bitmap {
     return scaled
 }
 
+/** YOLO class names; the walk finds targets by YOLO class only. */
 private val APPROACH_TARGETS = listOf(
-    "Bottle" to TRACK_BOTTLE,
-    "Cup" to "a cup",
-    "Ball" to "a ball",
-    "Shoe" to "a shoe",
-    "Toy" to "a toy",
+    "Bottle" to "bottle",
+    "Cup" to "cup",
+    "Ball" to "sports ball",
+    "Bowl" to "bowl",
+    "Teddy" to "teddy bear",
 )
 
 private fun targetLabel(query: String): String =
-    APPROACH_TARGETS.firstOrNull { it.second == query }?.first?.lowercase() ?: query.removePrefix("a ")
+    WalkOrders.targetLabel(query) ?: query.removePrefix("a ")
 
 @Composable
 private fun TargetChip(label: String, selected: Boolean, enabled: Boolean, onClick: () -> Unit) {

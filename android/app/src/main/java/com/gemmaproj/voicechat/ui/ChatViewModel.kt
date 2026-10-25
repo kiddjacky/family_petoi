@@ -29,12 +29,18 @@ import com.gemmaproj.voicechat.engine.SpeechToTextEngine
 import com.gemmaproj.voicechat.engine.SpokenChunker
 import com.gemmaproj.voicechat.engine.TextToSpeechEngine
 import com.gemmaproj.voicechat.engine.VoiceRecorder
+import com.gemmaproj.voicechat.engine.WalkOrder
+import com.gemmaproj.voicechat.engine.WalkOrders
+import com.gemmaproj.voicechat.engine.ObjectPlay
+import com.gemmaproj.voicechat.engine.PlayIdea
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withTimeout
@@ -78,6 +84,8 @@ data class ChatUiState(
     val trackReady: Boolean = false,
     val trackLive: Boolean = false,
     val trackTarget: String = TRACK_BOTTLE,
+    /** Spoken color of the walk target ("yellow"), to pick among same-class objects. */
+    val trackColor: String? = null,
     val trackBoxes: List<TrackBox> = emptyList(),
     val trackImageWidth: Int = 0,
     val trackImageHeight: Int = 0,
@@ -122,6 +130,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var playJob: Job? = null
     private var moveJob: Job? = null
     private var approachJob: Job? = null
+    /** Gemma writing the reply and play idea for the current walk target; runs while the dog walks. */
+    private var playIdeaJob: Job? = null
+    /** The play idea for one target, keyed by [targetKey], spoken at arrival. */
+    private var playIdea: Pair<String, PlayIdea>? = null
     private var speechError: String? = null
 
     init {
@@ -490,6 +502,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun runAutoAsk() {
         val app = getApplication<GemmaVoiceApp>()
+        app.walkProbe?.let { orders ->
+            app.walkProbe = null
+            runWalkProbe(orders.split('|').map { it.trim() }.filter { it.isNotEmpty() })
+            return
+        }
         app.dogAsk?.let { request ->
             app.dogAsk = null
             askDog(request)
@@ -741,8 +758,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun setTrackTarget(query: String) {
-        _uiState.value = _uiState.value.copy(trackTarget = query)
+    fun setTrackTarget(query: String, color: String? = null) {
+        _uiState.value = _uiState.value.copy(trackTarget = query, trackColor = color)
     }
 
     fun setTrackLive(enabled: Boolean) {
@@ -889,24 +906,58 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (approachJob?.isActive == true) return
         pilot.reset()
         val log = java.io.File(getApplication<Application>().filesDir, "approach-log.txt")
-        log.writeText("")
+        if (log.length() > APPROACH_LOG_MAX_BYTES) log.writeText("")
+        log.appendText("---\n")
         approachJob = viewModelScope.launch {
             try {
-                ensurePlayEmbedding()
                 withContext(Dispatchers.Default) { yolo.ensure(paths.yoloFile()) }
                 dog.keepConnected()
-                val query = _uiState.value.trackTarget
-                log.appendText("target $query robot ${dog.state.value.robotName.ifBlank { "not connected" }}\n")
+                var query = ""
+                var color: String? = null
+                var waitingForLink = false
+                log.appendText("robot ${dog.state.value.robotName.ifBlank { "not connected" }}\n")
                 pendingFrame.getAndSet(null)?.recycle()
                 while (isActive && _uiState.value.approachLive) {
+                    val wanted = WalkOrders.targetLabel(_uiState.value.trackTarget)
+                    if (wanted == null) {
+                        _uiState.value = _uiState.value.copy(
+                            approachLive = false,
+                            sceneCaption = "YOLO can't see \"${_uiState.value.trackTarget}\". Try a bottle, cup or ball.",
+                        )
+                        break
+                    }
+                    val wantedColor = _uiState.value.trackColor
+                    if (wanted != query || wantedColor != color) {
+                        if (query.isNotEmpty()) pilot.retarget()
+                        query = wanted
+                        color = wantedColor
+                        log.appendText("target ${color?.let { "$it " } ?: ""}$query\n")
+                    }
+                    if (!dog.isConnected) {
+                        // Deciding moves nobody receives would also wreck the robot track and heading.
+                        if (!waitingForLink) log.appendText("${System.currentTimeMillis()} link lost, waiting\n")
+                        waitingForLink = true
+                        pendingFrame.getAndSet(null)?.recycle()
+                        _uiState.value = _uiState.value.copy(sceneCaption = "Lost the robot. Waiting for it to reconnect…")
+                        delay(NO_LINK_WAIT_MS)
+                        continue
+                    }
+                    if (waitingForLink) {
+                        // It may have been picked up or rebooted; find it again by the probe step.
+                        waitingForLink = false
+                        pilot.reset()
+                        log.appendText("${System.currentTimeMillis()} link back, finding the robot again\n")
+                    }
                     val frame = pendingFrame.getAndSet(null)
                     if (frame == null) {
                         delay(FRAME_POLL_MS)
                         continue
                     }
                     val started = System.nanoTime()
+                    val target = query
+                    val targetColor = color
                     val result = try {
-                        pilot.step(frame, yolo, embed, query)
+                        withContext(Dispatchers.Default) { pilot.step(frame, yolo, target, targetColor) }
                     } finally {
                         frame.recycle()
                     }
@@ -943,7 +994,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         pendingFrame.getAndSet(null)?.recycle()
                     }
                     if (result.arrived || result.gaveUp) {
-                        if (result.arrived) attractAdult()
+                        if (result.arrived) greetAtTarget(result.caption, log)
                         _uiState.value = _uiState.value.copy(approachLive = false)
                         break
                     }
@@ -960,6 +1011,36 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
         }
+    }
+
+    /**
+     * Back to the start for the next round: the robot stands, the walk and Gemma's replies stop,
+     * and the target, color, boxes and captions are cleared. The robot link stays up.
+     */
+    fun restartDemo() {
+        if (_uiState.value.isRecording) return
+        stopApproach(sendStop = true)
+        if (_uiState.value.trackLive) stopPlayWatch()
+        playIdeaJob?.cancel()
+        playIdeaJob = null
+        playIdea = null
+        if (_uiState.value.isBusy) {
+            generationJob?.cancel()
+            gpu.cancel()
+        }
+        _uiState.value = _uiState.value.copy(
+            isBusy = false,
+            approachLive = false,
+            trackLive = false,
+            trackTarget = TRACK_BOTTLE,
+            trackColor = null,
+            trackBoxes = emptyList(),
+            headingLine = emptyList(),
+            sceneQuestion = "",
+            sceneCaption = "Ready. Hold to talk: \"go to the cup\".",
+            status = "Ready",
+        )
+        java.io.File(getApplication<Application>().filesDir, "approach-log.txt").appendText("--- restart\n")
     }
 
     private fun stopApproach(sendStop: Boolean) {
@@ -983,17 +1064,32 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * Gemma stays loaded next to EmbeddingGemma when memory allows, so spoken orders work
+     * during the walk. Only if neither embedding backend fits beside it is Gemma unloaded.
+     */
     private suspend fun ensurePlayEmbedding() {
-        if (chatPausedForTrack && embed.isReady) {
+        if (embed.isReady) {
             _uiState.value = _uiState.value.copy(trackReady = true)
             return
         }
         val file = paths.embeddingVision()
         if (!file.isFile) error("Missing ${file.name}. EmbeddingGemma is not on this phone.")
         _uiState.value = _uiState.value.copy(
-            status = "Loading EmbeddingGemma on GPU…",
+            status = "Loading EmbeddingGemma…",
             sceneCaption = "Loading EmbeddingGemma…",
         )
+        if (usingGpu && _uiState.value.isReady) {
+            // The GPU vision path loads beside Gemma but fails on the first image, so it is not tried here.
+            val beside = openEmbeddingBesideGemma("gpu-text cpu-vision") {
+                embed.open(file, useGpu = true, visionGpu = false, activation = ActivationDataType.FLOAT32)
+            } || openEmbeddingBesideGemma("cpu") { embed.open(file, useGpu = false) }
+            if (beside) {
+                _uiState.value = _uiState.value.copy(trackReady = true)
+                return
+            }
+            _uiState.value = _uiState.value.copy(sceneCaption = "Not enough memory for both; Gemma is paused. Use the buttons.")
+        }
         gpu.close()
         usingGpu = false
         chatPausedForTrack = true
@@ -1007,6 +1103,52 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             embed.open(file, useGpu = false)
         }
         _uiState.value = _uiState.value.copy(trackReady = true)
+    }
+
+    /** Opening is not enough: a backend counts only once it has embedded a real image. */
+    private suspend fun openEmbeddingBesideGemma(backend: String, open: suspend () -> Unit): Boolean {
+        return try {
+            open()
+            embed.embedImages(listOf(probeJpeg()))
+            Log.i(TAG, "embedding on $backend, Gemma stays loaded")
+            java.io.File(getApplication<Application>().filesDir, "approach-log.txt").appendText("embedding $backend beside Gemma\n")
+            true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            Log.w(TAG, "embedding on $backend beside Gemma failed", error)
+            withContext(Dispatchers.IO) { embed.close() }
+            false
+        }
+    }
+
+    private fun probeJpeg(): ByteArray {
+        val bitmap = android.graphics.Bitmap.createBitmap(PROBE_SIZE, PROBE_SIZE, android.graphics.Bitmap.Config.ARGB_8888)
+        bitmap.eraseColor(android.graphics.Color.GRAY)
+        val bytes = java.io.ByteArrayOutputStream()
+        bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, bytes)
+        bitmap.recycle()
+        return bytes.toByteArray()
+    }
+
+    /** At the target: the robot waves while the phone says hello and Gemma's game for this object. */
+    private suspend fun greetAtTarget(caption: String, log: java.io.File) {
+        _uiState.value = _uiState.value.copy(sceneCaption = "$caption $GREETING")
+        val tip = playIdeaForCurrentTarget()?.tip.orEmpty()
+        val speech = if (tip.isEmpty()) GREETING else "$GREETING $tip"
+        _uiState.value = _uiState.value.copy(sceneCaption = "$caption $speech")
+        coroutineScope {
+            val wave = async(Dispatchers.IO) {
+                if (!dog.isConnected) return@async "robot not connected"
+                try {
+                    dog.move(GREET_WAVE, timeoutMs = GREET_WAVE_MS)
+                } catch (error: IllegalStateException) {
+                    "wave failed ${error.message}"
+                }
+            }
+            speakDog(speech)
+            log.appendText("${System.currentTimeMillis()} greet said \"$speech\" sent $GREET_WAVE -> ${wave.await()}\n")
+        }
     }
 
     private fun attractAdult() {
@@ -1300,8 +1442,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Release: SenseVoice transcribes the utterance, then Gemma sees that text
-     * plus the JPEG captured at the press.
+     * Release: SenseVoice transcribes the utterance. Gemma first decides whether it is a walk
+     * order ("go to the red cup", "stop"); if so the robot is steered. Otherwise Gemma answers
+     * the words about the JPEG captured at the press.
      */
     fun onDirectionRelease(photo: CompletableDeferred<java.io.File>?) {
         if (!_uiState.value.isRecording) {
@@ -1327,6 +1470,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         status = "No speech detected",
                         sceneCaption = "No speech detected",
                     )
+                    return@launch
+                }
+                val order = readWalkOrder(transcript)
+                if (order != WalkOrder.Other) {
+                    photo?.cancel()
+                    obeyWalkOrder(order, transcript)
                     return@launch
                 }
                 val jpeg = withTimeout(4_000) {
@@ -1356,6 +1505,145 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     sceneCaption = message,
                 )
             }
+        }
+    }
+
+    private suspend fun readWalkOrder(said: String): WalkOrder {
+        if (WalkOrders.isStop(said)) return WalkOrder.Stop
+        if (!usingGpu || !_uiState.value.isReady) return WalkOrder.Other
+        // One Gemma conversation at a time: a new order outranks the last order's play idea.
+        playIdeaJob?.cancelAndJoin()
+        _uiState.value = _uiState.value.copy(status = "Gemma is reading the order…", sceneCaption = "“${said.trim()}”")
+        val raw = StringBuilder()
+        gpu.generateAs(WalkOrders.SYSTEM_PROMPT, said, WALK_ORDER_TOKENS).collect { raw.append(it) }
+        val order = WalkOrders.parse(visibleAssistantText(raw.toString()), said)
+        java.io.File(getApplication<Application>().filesDir, "approach-log.txt")
+            .appendText("heard \"${said.trim()}\" gemma ${raw.toString().replace('\n', ' ')} -> $order\n")
+        return order
+    }
+
+    /** `walkProbe` launch extra: how Gemma reads each order. Moves nothing. */
+    private fun runWalkProbe(orders: List<String>) {
+        viewModelScope.launch {
+            val out = java.io.File(getApplication<Application>().filesDir, "walk-probe.txt")
+            out.writeText("")
+            fun write(line: String) {
+                Log.i(TAG, "WALK_PROBE $line")
+                out.appendText(line + "\n")
+            }
+            try {
+                write("gemma_loaded=${usingGpu && _uiState.value.isReady}")
+                for (said in orders) {
+                    val started = System.nanoTime()
+                    val order = readWalkOrder(said)
+                    write("${(System.nanoTime() - started) / 1_000_000}ms \"$said\" -> $order")
+                    if (order is WalkOrder.GoTo) {
+                        val ideaStarted = System.nanoTime()
+                        val idea = writePlayIdea(said, order.label, order.color)
+                        write("  ${(System.nanoTime() - ideaStarted) / 1_000_000}ms reply: ${idea.reply}")
+                        write("  tip: ${idea.tip}")
+                    }
+                }
+                write("DONE")
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                write("FAIL ${error.message ?: error.javaClass.simpleName}")
+            }
+        }
+    }
+
+    private fun targetKey(label: String, color: String?): String = "${color.orEmpty()}|$label"
+
+    private fun currentTargetKey(): String? {
+        val state = _uiState.value
+        return WalkOrders.targetLabel(state.trackTarget)?.let { targetKey(it, state.trackColor) }
+    }
+
+    /**
+     * Gemma answers the order and thinks of a game with the object, while the dog already walks.
+     * With [heard] (a spoken order) the answer is shown and spoken now; the idea waits for arrival.
+     */
+    private fun startPlayIdea(said: String, label: String, color: String?, heard: String?): Job {
+        val previous = playIdeaJob
+        val key = targetKey(label, color)
+        val job = viewModelScope.launch {
+            previous?.cancelAndJoin()
+            val idea = writePlayIdea(said, label, color)
+            playIdea = key to idea
+            if (heard == null || currentTargetKey() != key) return@launch
+            if (_uiState.value.approachLive) _uiState.value = _uiState.value.copy(sceneCaption = "$heard ${idea.reply}")
+            speakDog(idea.reply)
+        }
+        playIdeaJob = job
+        return job
+    }
+
+    private suspend fun writePlayIdea(said: String, label: String, color: String?): PlayIdea {
+        if (!usingGpu || !_uiState.value.isReady) return ObjectPlay.fallback(label, color, said)
+        val log = java.io.File(getApplication<Application>().filesDir, "approach-log.txt")
+        val started = System.nanoTime()
+        val raw = StringBuilder()
+        return try {
+            gpu.generateAs(ObjectPlay.SYSTEM_PROMPT, ObjectPlay.request(said, label, color), PLAY_IDEA_TOKENS)
+                .collect { raw.append(it) }
+            val idea = ObjectPlay.parse(visibleAssistantText(raw.toString()), label, color, said)
+            log.appendText(
+                "play idea ${(System.nanoTime() - started) / 1_000_000}ms " +
+                    "raw ${raw.toString().replace('\n', ' ')} -> $idea\n",
+            )
+            idea
+        } catch (cancelled: CancellationException) {
+            gpu.cancel()
+            throw cancelled
+        } catch (error: Exception) {
+            Log.w(TAG, "play idea failed", error)
+            log.appendText("play idea failed ${error.message}\n")
+            ObjectPlay.fallback(label, color, said)
+        }
+    }
+
+    /** The play idea for the target just reached; written now if the order came from a chip. */
+    private suspend fun playIdeaForCurrentTarget(): PlayIdea? {
+        val state = _uiState.value
+        val label = WalkOrders.targetLabel(state.trackTarget) ?: return null
+        val key = targetKey(label, state.trackColor)
+        fun ready(): PlayIdea? = playIdea?.takeIf { it.first == key }?.second
+        ready()?.let { return it }
+        playIdeaJob?.takeIf { it.isActive }?.let { running -> withTimeoutOrNull(PLAY_IDEA_WAIT_MS) { running.join() } }
+        ready()?.let { return it }
+        val name = listOfNotNull(state.trackColor, label).joinToString(" ")
+        val job = startPlayIdea("Go to the $name.", label, state.trackColor, heard = null)
+        withTimeoutOrNull(PLAY_IDEA_WAIT_MS) { job.join() }
+        return ready()
+    }
+
+    private fun obeyWalkOrder(order: WalkOrder, said: String) {
+        val heard = "“${said.trim()}”"
+        when (order) {
+            WalkOrder.Stop -> {
+                playIdeaJob?.cancel()
+                if (_uiState.value.approachLive) setApproach(false)
+                _uiState.value = _uiState.value.copy(isBusy = false, status = "Stopped", sceneCaption = "$heard Stopped.")
+            }
+            is WalkOrder.GoTo -> {
+                setTrackTarget(order.label, order.color)
+                val switching = _uiState.value.approachLive
+                if (!switching) setApproach(true)
+                val name = listOfNotNull(order.color, order.label).joinToString(" ")
+                _uiState.value = _uiState.value.copy(
+                    isBusy = false,
+                    status = if (switching) "New target" else "Walking",
+                    sceneCaption = "$heard Going to the $name.",
+                )
+                startPlayIdea(said, order.label, order.color, heard)
+            }
+            is WalkOrder.CannotSee -> _uiState.value = _uiState.value.copy(
+                isBusy = false,
+                status = "Not a YOLO object",
+                sceneCaption = "$heard The camera can't recognize ${order.name}. Try a bottle, cup, ball or teddy bear.",
+            )
+            WalkOrder.Other -> _uiState.value = _uiState.value.copy(isBusy = false)
         }
     }
 
@@ -1760,6 +2048,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         private const val FRAME_POLL_MS = 40L
         private const val DOG_TOKENS = 160
         private const val SETTLE_MS = 400L
+        private const val WALK_ORDER_TOKENS = 48
+        private const val PLAY_IDEA_TOKENS = 160
+        /** Arrival waits this long for Gemma's game idea before waving without it. */
+        private const val PLAY_IDEA_WAIT_MS = 8_000L
+        private const val PROBE_SIZE = 64
+        private const val APPROACH_LOG_MAX_BYTES = 256 * 1024L
+        private const val GREETING = "Hello!"
+        private const val GREET_WAVE = "khi"
+        private const val GREET_WAVE_MS = 15_000L
         private const val NO_LINK_WAIT_MS = 1_000L
         private const val STOP_ATTEMPTS = 20
         private const val STOP_RETRY_MS = 300L

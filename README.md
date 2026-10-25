@@ -1,23 +1,45 @@
-# Gemma Voice Chat (Android)
+# Family Petoi — Gemma Voice
 
-On-device voice and text chat for **OnePlus 12** (Snapdragon 8 Gen 3, 16 GB RAM) using:
+On-device Android app (`com.gemmaproj.voicechat`) that talks with **Gemma 4** on the phone and walks a **Petoi robot dog** (Quaddle / Bittle) to objects you name. Built and tested on a **OnePlus 12** (Snapdragon 8 Gen 3, 16 GB RAM). Everything after the first model copy is offline. No cloud API keys.
 
-| Component | Stack | Default model |
-|-----------|--------|----------------|
-| LLM | [llama.cpp](https://github.com/ggml-org/llama.cpp) Android binding (KleidiAI on arm64) | **Gemma 4 E2B or E4B** `Q4_K_M` |
-| STT | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | **SenseVoice** int8 (multilingual) or **Whisper** tiny.en |
-| TTS | sherpa-onnx Kokoro | **kokoro-multi-lang-v1_0** |
+| Piece | What runs on the phone | Role |
+|-------|------------------------|------|
+| Chat + orders | **Gemma 4 E2B** LiteRT GPU (`gemma-4-E2B-it-gpu.litertlm`) | Answers you, reads walk orders, writes a short play tip |
+| Hear | **SenseVoice** int8 (sherpa-onnx) | English and Chinese speech |
+| Speak | **Kokoro** multi-lang (sherpa-onnx) | Phone speaker; the robot has none |
+| See | **YOLO26n** LiteRT (`yolo26n_w8a32.tflite`) | Finds objects and the robot in the camera |
+| Walk | **Petoi BLE** Nordic UART | Sends `kwkF` / `kwkL` / `kwkR` / `kbalance` / `khi` |
 
-Everything runs offline after models are copied to the phone. No cloud API keys.
+The last committed baseline was chat + a BLE walk pad. This version adds voice “go to …” walking, YOLO tracking, auto-reconnect, and Gemma’s arrival greeting.
 
-## Why these choices on OnePlus 12
+## What you can do
 
-- **Gemma 2 2B Q4_K_M**: Good quality/speed balance; expect roughly **8–20 tok/s** on SD 8 Gen 3 (varies with context length and thermal state).
-- **SenseVoice int8**: Strong zh/en/ja/ko/yue ASR in one small model; good for mixed-language speech.
-- **Whisper tiny.en**: Lighter English-only option if you do not need SenseVoice languages.
-- **Kokoro**: Fast non-autoregressive TTS; multiple English voices via speaker id.
+**Hold to talk** on the camera screen (English or Chinese):
 
-Alternatives that also fit 16 GB RAM: **Gemma 3 1B** (faster, smaller), **Qwen2.5-1.5B-Instruct** (multilingual chat).
+- “go to the water bottle” / “走到那个红色的杯子那里” — Gemma names a YOLO class (and a color if you said one). The dog walks there.
+- “go to the yellow can” — both the can and the water bottle are `bottle` to YOLO; the spoken color picks the yellow one.
+- “now the cup” / “去找那只小熊” — switches target mid-walk.
+- “stop” / “停” — stands still, no Gemma wait.
+
+On the way, Gemma answers in the language you used. When the boxes touch, the phone says **Hello!** plus a short parent–child game for that object, and the robot waves (`khi`).
+
+**Buttons:** chips for bottle / cup / ball / bowl / teddy, **Go to …** / **Stop**, **Restart** (clears the walk and target; the BLE link stays up), **Live**, **Find**. On the Dog tab, **Switch robot** forgets the saved name and connects to the nearest Petoi.
+
+## How the walk works
+
+1. YOLO26n runs on the 1280×960 camera frame, tiled (whole frame plus overlapping 640 px tiles), confidence 0.12, up to 32 boxes. NMS is per class so a “person” box on the robot does not delete a “motorcycle” box on the same spot.
+2. The **target** is the box with that COCO class. A spoken color samples the middle of each same-class box (HSV) and keeps the one that matches. Once chosen, identity stays locked; each look snaps the box to the newest match so a moved object is followed.
+3. The **robot** has no COCO class (YOLO calls it horse, person, motorcycle, dog…). A short probe step (`kwkF 2`) finds which remaining small box moved. After that it is followed by position and size, not by label.
+4. Heading is measured from that movement. The loop is probe forward → turn toward the target → probe forward until the boxes touch.
+5. If YOLO misses a frame, the last boxes stay and the dog keeps moving. If Bluetooth drops, the walk pauses and resumes after reconnect.
+
+Only one BLE client can hold the robot. Close the Petoi phone app. The first robot this app connects to is remembered (`shared_prefs/dog.xml`); later scans ignore the others until you tap **Switch robot**.
+
+## Limits we already hit
+
+- YOLO26n is the nano 8-bit COCO model. It has no `robot` or `can` class. The yellow can scores as `bottle` (~0.3–0.5); robots flicker between labels. Locking + color + motion ID paper over this; they do not fix the model.
+- After a wave the robot can stop advertising for about two minutes (power on the robot). The app retries every few seconds.
+- Gemma 4 image answers take 6–8 s per photo, so the walk uses YOLO, not Gemma, for boxes.
 
 ## Quick start
 
@@ -28,9 +50,11 @@ cd /Users/robotdepot/work/gemma_proj
 ./scripts/bootstrap.sh
 ```
 
-This clones `llama.cpp`, downloads sherpa-onnx Android JNI libraries, and copies the Kotlin API into `:sherpa`.
+Clones `llama.cpp`, downloads sherpa-onnx Android JNI, and copies the Kotlin API into `:sherpa`.
 
-### 2. Download models (optional on desktop, or on phone)
+### 2. Models on the phone
+
+Use the project venv (do not re-download GGUFs, LiteRT files, or EmbeddingGemma unless you are missing them):
 
 ```bash
 python3 -m venv .venv
@@ -39,64 +63,81 @@ pip install -r scripts/requirements.txt
 python scripts/download_models.py --profile oneplus12
 ```
 
-Models land in `models/` (~4–5 GB total). Copy that folder to the phone:
-
-`Android/data/com.gemmaproj.voicechat/files/models/`
-
-Or push from your computer after building the tree above:
-
-Models must live in the app **internal** folder `files/models/` (see `ModelPaths.kt`). Easiest: Android Studio **Device File Explorer** → `data/data/com.gemmaproj.voicechat/files/models/`. Or:
+Copy into the app **internal** folder `files/models/` (`ModelPaths.kt`). Easiest: Android Studio Device File Explorer → `data/data/com.gemmaproj.voicechat/files/models/`. Or:
 
 ```bash
 adb push models /data/local/tmp/gemma-models
 adb shell run-as com.gemmaproj.voicechat cp -r /data/local/tmp/gemma-models files/models
 ```
 
-See [docs/MODELS.md](docs/MODELS.md) for exact filenames.
+Needed for this walk build, besides chat/voice:
+
+| Path under `files/models/` | Use |
+|----------------------------|-----|
+| `litert/gemma-4-E2B-it-gpu.litertlm` | Gemma orders, replies, play tips |
+| `litert/yolo26n_w8a32.tflite` | Object + robot boxes |
+| SenseVoice + `tts/kokoro-multi-lang-v1_0/` | Hear / speak |
+
+See [docs/MODELS.md](docs/MODELS.md). Gemma weights need [Google’s Gemma Terms of Use](https://ai.google.dev/gemma/terms).
 
 ### 3. Build and install
 
-Open **`android/`** in Android Studio (Ladybug or newer), install NDK **29.0.13113456** (same as upstream llama.android), sync Gradle, run on device.
+Open **`android/`** in Android Studio (Ladybug or newer), NDK **29.0.13113456**, or:
 
 ```bash
+export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 cd android
+# wrapper lives under ~/.gradle if ./gradlew is missing
 ./gradlew :app:assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-First native build of `:lib` (llama.cpp) can take **15–30 minutes**; later builds are incremental.
+First native build of `:lib` (llama.cpp) can take 15–30 minutes.
 
-### 4. Accept Gemma license
+App logs do not reach logcat on the OnePlus 12. Read files instead:
 
-Gemma weights require accepting [Google’s Gemma Terms of Use](https://ai.google.dev/gemma/terms) on Hugging Face before download.
+```bash
+adb shell "run-as com.gemmaproj.voicechat cat files/approach-log.txt"
+adb shell "run-as com.gemmaproj.voicechat cat files/dog-log.txt"
+```
 
-## App usage
-
-- **Text mode**: Type messages; replies stream from Gemma.
-- **Voice mode**: Hold the microphone button, speak, release; STT → Gemma → Kokoro playback.
-- **Settings**: Switch STT engine (SenseVoice / Whisper), TTS on/off, system prompt, max tokens.
+Launch extras (force-stop first): `walkProbe` (`'|'`-separated orders, parse only, no motion), `dogAsk`, `dogPad`.
 
 ## Project layout
 
 ```
 gemma_proj/
-  android/           # Gemma Voice Chat app (:app), sherpa (:sherpa), llama (:lib)
-  scripts/           # bootstrap, model download
-  third_party/       # llama.cpp (created by bootstrap)
-  models/            # downloaded GGUF + ONNX (gitignored)
+  android/app/.../engine/
+    ApproachPilot.kt   # walk decisions
+    YoloDetector.kt    # tiled YOLO26n
+    WalkOrders.kt      # Gemma JSON → go / stop / other
+    ColorMatch.kt      # spoken color among same-class boxes
+    ObjectPlay.kt      # reply + play tip
+    DogLink.kt         # BLE keep-alive, remembered robot
+    PetoiBle.kt        # Nordic UART
+  android/app/.../ui/
+    SceneCamera.kt     # camera, chips, Restart
+    ChatViewModel.kt   # orders, walk loop, greeting
+    DogScreen.kt       # walk pad + Switch robot
+  scripts/             # bootstrap, model download
+  models/              # gitignored
   docs/ARCHITECTURE.md
+  docs/MODELS.md
 ```
 
 ## Troubleshooting
 
 | Issue | Fix |
 |-------|-----|
-| Slow first token | Use Q4_K_M not Q8; reduce `context` to 2048; close background apps |
-| OOM on load | Use Gemma 3 1B or Q3_K_M; ensure models are on internal storage |
-| STT empty | Check `models/asr/...` paths; 16 kHz mono PCM; grant mic permission |
-| TTS silent | Install Kokoro assets under `models/tts/kokoro-multi-lang-v1_0/`; try speaker id `0` |
-| Build fails on `:lib` | Match NDK version in Android Studio SDK Manager |
+| “No Petoi robot is advertising” | Power the dog, close the Petoi app, wait if it just waved. Tap **Switch robot** if the saved name is the old one. |
+| Connected to the wrong dog | **Switch robot** on the Dog tab, then turn only the one you want on. |
+| Walks to the water bottle instead of the can | Say the color: “go to the yellow can”. |
+| Robot box flickers / “dog unseen” | YOLO has no robot class; the walk follows the last box and the one that moved. Keep the phone steady. |
+| Gemma paused / buttons only | EmbeddingGemma and Gemma 4 both loaded; if memory is short, Gemma unloads. Restart the app. |
+| STT empty | Mic permission; SenseVoice under `models/asr/...`; 16 kHz mono. |
+| TTS silent | Kokoro under `models/tts/kokoro-multi-lang-v1_0/`. |
+| Slow first token | Keep E2B GPU; close background apps. Do not switch chat to FP16 or turn on speculative decoding. |
 
 ## License
 
-Application code: MIT. Third-party models and libraries follow their respective licenses (Gemma Terms, sherpa-onnx Apache 2.0, llama.cpp MIT).
+Application code: MIT. Third-party models and libraries follow their own licenses (Gemma Terms, sherpa-onnx Apache 2.0, llama.cpp MIT, Ultralytics YOLO).

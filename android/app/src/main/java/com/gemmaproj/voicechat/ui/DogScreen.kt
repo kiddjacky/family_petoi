@@ -31,6 +31,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -69,7 +70,7 @@ fun DogScreen(link: DogLink, chat: ChatViewModel) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        LinkHeader(state.robotName, state.connected)
+        LinkHeader(state.robotName, state.connected, onSwitch = link::forgetRobot)
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -100,7 +101,7 @@ fun DogScreen(link: DogLink, chat: ChatViewModel) {
 }
 
 @Composable
-private fun LinkHeader(robotName: String, connected: Boolean) {
+private fun LinkHeader(robotName: String, connected: Boolean, onSwitch: () -> Unit) {
     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Box(
@@ -122,6 +123,9 @@ private fun LinkHeader(robotName: String, connected: Boolean) {
         )
         if (!connected) {
             LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(top = 8.dp))
+        }
+        TextButton(onClick = onSwitch) {
+            Text("Switch robot (connect to the nearest)")
         }
     }
 }

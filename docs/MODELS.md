@@ -51,6 +51,14 @@ See [Kokoro pretrained models](https://k2-fsa.github.io/sherpa/onnx/tts/pretrain
 
 Speaker id **0–52** (English voices often in low ids; try `af_sarah` mapping in Kokoro docs → numeric sid in app settings).
 
+## Detector — YOLO26n (walk to object)
+
+Folder: `models/litert/` (copied to `files/models/litert/` on the phone)
+
+| File | Size | Notes |
+|------|------|--------|
+| `yolo26n_w8a32.tflite` | ~2.9 MB | Ultralytics YOLO26 nano, 8-bit weights, 80 COCO classes, 640 input. The app tiles a 1280×960 frame. No `robot` or `can` class. |
+
 ## Total storage budget (OnePlus 12)
 
 | Profile | Approx. |

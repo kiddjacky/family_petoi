@@ -37,7 +37,11 @@ internal class PetoiBle(context: Context) {
     private val gattThread = HandlerThread("petoi-ble").apply { start() }
     private val gattHandler = Handler(gattThread.looper)
 
-    private var gatt: BluetoothGatt? = null
+    @Volatile private var gatt: BluetoothGatt? = null
+    @Volatile private var lastHeardNs = 0L
+
+    /** Milliseconds since the robot last sent anything. */
+    val quietMs: Long get() = (System.nanoTime() - lastHeardNs) / 1_000_000
     private var rx: BluetoothGattCharacteristic? = null
     private var ready = false
     private var closed = false
@@ -49,13 +53,14 @@ internal class PetoiBle(context: Context) {
     var robotName: String = ""
         private set
 
-    fun connect(): String = callLock.withLock {
+    /** With [onlyName], other Petoi robots nearby are ignored even when their signal is stronger. */
+    fun connect(onlyName: String? = null): String = callLock.withLock {
         closed = false
         closeGatt()
         val adapter = appContext.getSystemService(BluetoothManager::class.java)?.adapter
             ?: error("This phone has no Bluetooth")
         if (!adapter.isEnabled) error("Bluetooth is off")
-        val (name, device) = scan(adapter)
+        val (name, device) = scan(adapter, onlyName)
         robotName = name
         openGatt(device)
         handshake()
@@ -75,6 +80,25 @@ internal class PetoiBle(context: Context) {
         send(command, timeoutMs)
     }
 
+    /**
+     * Sends `?` (prints the model and version; moves nothing) and reports whether any reply came.
+     * Skipped, as alive, while a command holds the link: that command will notice a dead robot.
+     */
+    fun ping(timeoutMs: Long): Boolean {
+        if (!callLock.tryLock()) return true
+        try {
+            if (!ready || closed) return false
+            synchronized(bufferLock) { buffer.setLength(0) }
+            writeBlocking("?\n")
+            return waitForText(timeoutMs).isNotEmpty()
+        } catch (error: IllegalStateException) {
+            Log.w(TAG, "ping: ${error.message}")
+            return false
+        } finally {
+            callLock.unlock()
+        }
+    }
+
     fun close() {
         closed = true
         synchronized(bufferLock) { bufferLock.notifyAll() }
@@ -82,16 +106,24 @@ internal class PetoiBle(context: Context) {
         callLock.withLock { closeGatt() }
     }
 
-    private fun scan(adapter: android.bluetooth.BluetoothAdapter): Pair<String, BluetoothDevice> {
+    private fun scan(adapter: android.bluetooth.BluetoothAdapter, onlyName: String?): Pair<String, BluetoothDevice> {
         val scanner = adapter.bluetoothLeScanner ?: error("Bluetooth LE is not available")
         val found = ArrayList<Triple<Int, String, BluetoothDevice>>()
+        val nearby = linkedSetOf<String>()
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
-                val name = result.scanRecord?.deviceName ?: result.device.name ?: return
-                if (!isPetoiName(name)) return
+                val record = result.scanRecord
+                val name = record?.deviceName ?: result.device.name
+                val hasNus = record?.serviceUuids.orEmpty().any { it.uuid == NUS_SERVICE }
+                if (!name.isNullOrBlank()) synchronized(nearby) { nearby.add("$name ${result.rssi}") }
+                val label = when {
+                    !name.isNullOrBlank() && isPetoiName(name) -> name
+                    hasNus -> name?.takeIf { it.isNotBlank() } ?: "Petoi"
+                    else -> return
+                }
                 synchronized(found) {
                     found.removeAll { it.third.address == result.device.address }
-                    found.add(Triple(result.rssi, name, result.device))
+                    found.add(Triple(result.rssi, label, result.device))
                 }
             }
 
@@ -110,8 +142,19 @@ internal class PetoiBle(context: Context) {
                 Log.w(TAG, "stopScan: ${error.message}")
             }
         }
-        val best = synchronized(found) { found.maxByOrNull { it.first } }
-            ?: error("No Petoi robot is advertising. Turn it on and close the Petoi phone app.")
+        val best = synchronized(found) { found.filter { onlyName == null || it.second == onlyName }.maxByOrNull { it.first } }
+            ?: if (onlyName != null) {
+                error("$onlyName is not advertising. Turn it on and close the Petoi phone app.")
+            } else {
+                val others = synchronized(nearby) { nearby.joinToString(", ") }
+                error(
+                    if (others.isEmpty()) {
+                        "No Petoi robot is advertising. Turn it on and close the Petoi phone app."
+                    } else {
+                        "No Petoi robot is advertising (nearby: $others). Turn it on and close the Petoi phone app."
+                    },
+                )
+            }
         Log.i(TAG, "bluetooth ${best.second} rssi=${best.first}")
         return best.second to best.third
     }
@@ -130,8 +173,12 @@ internal class PetoiBle(context: Context) {
                 if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     ready = false
                     if (failMessage == null) failMessage = "Bluetooth disconnected ($status)"
+                    // A dead GATT left open makes Android refuse the next connect (status 133).
+                    gatt.close()
+                    if (this@PetoiBle.gatt === gatt) this@PetoiBle.gatt = null
                     latch.countDown()
                     synchronized(sessionLock) { sessionLock.notifyAll() }
+                    synchronized(bufferLock) { bufferLock.notifyAll() }
                 }
             }
 
@@ -179,6 +226,7 @@ internal class PetoiBle(context: Context) {
                 value: ByteArray,
             ) {
                 val text = value.toString(Charsets.ISO_8859_1)
+                lastHeardNs = System.nanoTime()
                 synchronized(bufferLock) {
                     buffer.append(text)
                     bufferLock.notifyAll()
@@ -269,6 +317,7 @@ internal class PetoiBle(context: Context) {
             while (!closed && System.nanoTime() < end) {
                 val lines = completeLines()
                 if (lines.any { it.equals(token, ignoreCase = true) }) return lines
+                if (!ready) error("Bluetooth disconnected during $what")
                 val left = end - System.nanoTime()
                 if (left <= 0) break
                 bufferLock.wait(waitMillis(left))

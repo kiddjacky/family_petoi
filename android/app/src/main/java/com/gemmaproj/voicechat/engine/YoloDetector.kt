@@ -7,13 +7,14 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 import org.tensorflow.lite.Interpreter
 
 /**
- * YOLO26n boxes for one photo. The class name is only a hint. EmbeddingGemma
- * decides which box is the robot and which box is the object to walk toward.
+ * YOLO26n boxes for one photo, labelled with the 80 COCO classes.
  *
  * The LiteRT export is NCHW float [1, 3, 640, 640] in and [1, 84, 8400] out.
  * The 84 channels are cx, cy, w, h in 0..1 of the letterboxed canvas, then 80
@@ -37,6 +38,68 @@ internal class YoloDetector {
     }
 
     fun detect(source: Bitmap, encodeCrops: Boolean = true): List<YoloBox> = synchronized(this) {
+        nms(candidates(source)).take(MAX_BOXES).map { box ->
+            if (encodeCrops) box.withCrop(source) else box
+        }
+    }
+
+    /**
+     * Shrinking a whole frame to 640 leaves a bottle or a robot across the room 10-20 px tall,
+     * and YOLO misses it. The frame is also cut into overlapping tiles the size of the model
+     * input, so tiles run unscaled, and every box is mapped back to the whole frame. A 1280×960
+     * frame is 3×2 tiles plus the whole frame: seven YOLO runs.
+     */
+    fun detectTiled(source: Bitmap): List<YoloBox> = synchronized(this) {
+        val found = ArrayList(candidates(source))
+        if (max(source.width, source.height) > INPUT) {
+            val tileWidth = min(INPUT, source.width)
+            val tileHeight = min(INPUT, source.height)
+            for (left in tileStarts(source.width, tileWidth)) {
+                for (top in tileStarts(source.height, tileHeight)) {
+                    val tile = Bitmap.createBitmap(source, left, top, tileWidth, tileHeight)
+                    try {
+                        found += candidates(tile).map { box ->
+                            box.copy(
+                                left = (left + box.left * tileWidth) / source.width,
+                                top = (top + box.top * tileHeight) / source.height,
+                                right = (left + box.right * tileWidth) / source.width,
+                                bottom = (top + box.bottom * tileHeight) / source.height,
+                            )
+                        }
+                    } finally {
+                        tile.recycle()
+                    }
+                }
+            }
+        }
+        dropCutPieces(nms(found)).take(MAX_TILED_BOXES)
+    }
+
+    /** Evenly spread tile origins, neighbours overlapping by at least [TILE_OVERLAP] px. */
+    private fun tileStarts(length: Int, tile: Int): List<Int> {
+        if (length <= tile) return listOf(0)
+        val count = ceil((length - TILE_OVERLAP).toFloat() / (tile - TILE_OVERLAP)).toInt()
+        return (0 until count).map { index -> ((length - tile).toFloat() * index / (count - 1)).roundToInt() }
+    }
+
+    /** A tile edge can cut an object; the cut piece sits inside the whole box from the next tile. */
+    private fun dropCutPieces(boxes: List<YoloBox>): List<YoloBox> {
+        val kept = ArrayList<YoloBox>(boxes.size)
+        for (box in boxes.sortedByDescending { (it.right - it.left) * (it.bottom - it.top) }) {
+            val area = (box.right - box.left) * (box.bottom - box.top)
+            val inside = kept.any { bigger ->
+                bigger.label == box.label && overlapArea(bigger, box) >= area * CUT_PIECE_INSIDE
+            }
+            if (!inside) kept += box
+        }
+        return kept.sortedByDescending { it.score }
+    }
+
+    private fun overlapArea(a: YoloBox, b: YoloBox): Float =
+        max(0f, min(a.right, b.right) - max(a.left, b.left)) * max(0f, min(a.bottom, b.bottom) - max(a.top, b.top))
+
+    /** Every box above [CONFIDENCE] for one image, before NMS, in 0..1 of that image. */
+    private fun candidates(source: Bitmap): List<YoloBox> {
         val engine = interpreter ?: error("YOLO is not loaded")
         val inputShape = engine.getInputTensor(0).shape()
         val outputShape = engine.getOutputTensor(0).shape()
@@ -63,10 +126,7 @@ internal class YoloDetector {
         input.rewind()
         val raw = scratchOutput(outputShape[1], outputShape[2])
         engine.run(input, raw)
-        val candidates = decode(raw[0], letter, source.width, source.height)
-        nms(candidates).take(MAX_BOXES).map { box ->
-            if (encodeCrops) box.withCrop(source) else box
-        }
+        return decode(raw[0], letter, source.width, source.height)
     }
 
     fun close() = synchronized(this) {
@@ -130,7 +190,7 @@ internal class YoloDetector {
             val top = ((centerY - boxHeight / 2f) / imageHeight).coerceIn(0f, 1f)
             val right = ((centerX + boxWidth / 2f) / imageWidth).coerceIn(0f, 1f)
             val bottom = ((centerY + boxHeight / 2f) / imageHeight).coerceIn(0f, 1f)
-            if (right - left < 0.02f || bottom - top < 0.02f) continue
+            if (right - left < MIN_BOX || bottom - top < MIN_BOX) continue
             found += YoloBox(
                 label = COCO_NAMES[bestClass],
                 score = bestScore,
@@ -144,11 +204,16 @@ internal class YoloDetector {
         return found
     }
 
+    /**
+     * Same-class boxes that overlap are one object. Different classes that overlap (a "person"
+     * sitting on a "motorcycle" that is actually the robot) must both stay, or the walk loses
+     * one of them.
+     */
     private fun nms(boxes: List<YoloBox>): List<YoloBox> {
         val ordered = boxes.sortedByDescending { it.score }
         val kept = ArrayList<YoloBox>(ordered.size)
         for (box in ordered) {
-            if (kept.none { intersectionOverUnion(it, box) > IOU }) kept += box
+            if (kept.none { it.label == box.label && intersectionOverUnion(it, box) > IOU }) kept += box
         }
         return kept
     }
@@ -184,11 +249,18 @@ internal class YoloDetector {
     companion object {
         private const val INPUT = 640
         private const val ANCHORS = 8400
-        private const val CONFIDENCE = 0.25f
+        /** Low enough that a far yellow can (~0.3) and a weakly labelled robot still count. */
+        private const val CONFIDENCE = 0.12f
         private const val IOU = 0.45f
-        private const val MAX_BOXES = 8
+        private const val MAX_BOXES = 16
+        private const val MAX_TILED_BOXES = 32
+        /** Share of the frame; distant toys sit around 0.01 on a 1280 frame. */
+        private const val MIN_BOX = 0.008f
+        /** Wide enough that an object cut by one tile edge is whole in the neighbouring tile. */
+        private const val TILE_OVERLAP = 128
+        private const val CUT_PIECE_INSIDE = 0.7f
 
-        private val COCO_NAMES = arrayOf(
+        val COCO_NAMES = arrayOf(
             "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
             "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
             "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",

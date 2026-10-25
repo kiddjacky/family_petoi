@@ -56,6 +56,7 @@ class MainActivity : ComponentActivity() {
             app.pointPhoto = intent.getStringExtra("pointPhoto")
             app.gemmaAudio = intent.getBooleanExtra("gemmaAudio", false)
             app.dogAsk = intent.getStringExtra("dogAsk")
+            app.walkProbe = intent.getStringExtra("walkProbe")
             val dogPad = intent.getBooleanExtra("dogPad", false) || app.dogAsk != null
             if (dogPad) TabMemory.save(this, MainTab.DOG)
             if (app.autoAsk != null || app.voiceProbeWav != null || app.gemmaAudio || app.pointPhoto != null || dogPad) {

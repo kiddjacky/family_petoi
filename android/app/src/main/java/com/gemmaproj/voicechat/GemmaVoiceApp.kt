@@ -22,6 +22,9 @@ class GemmaVoiceApp : Application() {
     @Volatile
     var dogAsk: String? = null
 
+    /** Spoken-style walk orders split by '|'. Loads EmbeddingGemma beside Gemma and parses each; no robot motion. */
+    @Volatile
+    var walkProbe: String? = null
     /** Absolute path of a photo to scan for the object a person is pointing at. */
     @Volatile
     var pointPhoto: String? = null
