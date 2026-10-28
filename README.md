@@ -1,6 +1,6 @@
 # Family Petoi — Gemma Voice
 
-On-device Android app (`com.gemmaproj.voicechat`) that talks with **Gemma 4** on the phone and walks a **Petoi robot dog** (Quaddle / Bittle) to objects you name. Built and tested on a **OnePlus 12** (Snapdragon 8 Gen 3, 16 GB RAM). Everything after the first model copy is offline. No cloud API keys.
+A vibecoded, on-device **physical AI** app (`com.gemmaproj.voicechat`) that talks with **Gemma 4** on the phone and walks a **Petoi robot dog** (Quaddle / Bittle) to objects you name — embodied AI that sees the room through the camera and moves a real robot in it, not just a chatbot. Built and tested on a **OnePlus 12** (Snapdragon 8 Gen 3, 16 GB RAM). Everything after the first model copy is offline. No cloud API keys.
 
 | Piece | What runs on the phone | Role |
 |-------|------------------------|------|
@@ -11,6 +11,10 @@ On-device Android app (`com.gemmaproj.voicechat`) that talks with **Gemma 4** on
 | Walk | **Petoi BLE** Nordic UART | Sends `kwkF` / `kwkL` / `kwkR` / `kbalance` / `khi` |
 
 The last committed baseline was chat + a BLE walk pad. This version adds voice “go to …” walking, YOLO tracking, auto-reconnect, and Gemma’s arrival greeting.
+
+## Built with Petoi
+
+This demo was built at [AGI House's Google Gemma Hardware Hackathon](https://www.agihouse.org/events/the-google-gemma-hardware-hackathon) — a day of hands-on building with Gemma on real hardware. It controls a [Petoi](https://www.petoi.com) robot — [Bittle X robot dog](https://www.petoi.com/products/petoi-robot-dog-bittle-x-voice-controlled), [Nybble Q robot cat](https://www.petoi.com/products/petoi-nybble-q-robot-cat) or [Quaddle mini robot dog](https://www.petoi.com/pages/quaddle-educational-robot-kit) — over BLE, starting from Petoi's official on-device Gemma starter kit, [`opencat-gemma`](https://github.com/PetoiCamp/opencat-gemma) ("Talk to Petoi robots (Bittle X, Nybble Q, Quaddle) with on-device Gemma"). Petoi's robots turned out to be a good fit for that format: small enough to carry in, battery-powered, and paired with no WiFi and no cloud API key needed — just the phone and the robot. Quaddle itself is built for "STEAM/Robotics/Physical AI educators," and this app is one concrete example of that physical AI loop running fully on-device.
 
 ## What you can do
 
